@@ -84,7 +84,7 @@ log = logging.getLogger("bot")
 @dataclass
 class Config:
     # Deriv API
-    api_token: str = "iCCn0vuMCzLcq1J"
+    api_token: str = "3nMoTkW49VHJqhH"
     app_id:    str = field(default_factory=lambda: os.getenv("DERIV_APP_ID", "1089"))
     api_url:   str = "wss://ws.binaryws.com/websockets/v3"
 
