@@ -150,8 +150,8 @@ class Config:
     #   Loss 2 → $0.35 × 2.1 = $0.74      cumulative risk: $1.09
     #   Loss 3 → $0.74 × 2.1 = $1.55      cumulative risk: $2.64  ← max
     marti_factor:    float = 2.1
-    marti_kick_in:   int   = 1    # escalate after this many consecutive losses
-    marti_max_steps: int   = 3    # max escalation steps (0.35 -> 0.74 -> 1.55 -> 3.25)
+    marti_kick_in:   int   = 2    # escalate after this many consecutive losses
+    marti_max_steps: int   = 4    # max escalation steps (0.35 -> 0.74 -> 1.55 -> 3.25)
 
     # ── SETTLEMENT VERIFICATION (NEW) ────────────────────────────────────────
     # How long to wait total after expiry before giving up on settlement
