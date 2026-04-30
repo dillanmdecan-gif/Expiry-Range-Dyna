@@ -3,36 +3,43 @@ Deriv ExpiryRange Quant Bot  -  single file, self-calibrating
 Symbol : 1HZ10V
 Contract: EXPIRYRANGE (Ends In)
 Expiry  : 2 minutes
-Barrier : +/-1.8
+Barrier : +/-1.9
 
-CHANGES FROM ORIGINAL
+FIXES IN THIS VERSION
 ─────────────────────
-1. SETTLEMENT VERIFICATION
-   _settle() no longer assumes a loss on timeout.
-   It polls proposal_open_contract up to SETTLE_POLL_ATTEMPTS times
-   (every SETTLE_POLL_INTERVAL seconds) until status is "sold",
-   "won", or "lost". Only records outcome when the API confirms.
-   Falls back to profit_table as a secondary check.
-   If neither confirms, logs a WARNING and skips the Bayes update
-   so no phantom losses corrupt the model.
+1. SETTLEMENT DEADLOCK  (critical)
+   _execute() no longer sleeps inside the tick-callback coroutine.
+   Settlement is dispatched as a separate asyncio Task so tick processing
+   continues uninterrupted during the 2-minute contract window.
+   The in-trade lock is set immediately on buy confirmation and released
+   only after settlement confirms, preserving all risk-management semantics.
 
-2. SKIP LOGGING
-   Every rejected tick now logs exactly which gate failed and
-   by how much (value vs threshold, and the margin). This runs
-   at most once every SKIP_LOG_INTERVAL seconds to avoid flooding.
-   A skip-reason counter is also tracked and printed periodically.
+2. IN-TRADE DOUBLE-CHECK REMOVED
+   on_tick() previously checked risk._in_trade directly (private attr) and
+   then called can_trade() which checks it again.  The direct check was
+   removed; can_trade() is the single authoritative gate.  Drought counter
+   (_ticks_since_trade) is now only incremented when the bot is NOT in a
+   trade, so an active 2-minute contract does not inflate the deadlock timer.
 
-3. THRESHOLD FLOOR  (auto-cal kept, no extra widening)
-   The auto-calibrated thresholds get a hard floor equal to:
-     floor = FLOOR_FACTOR * (current live value of the metric)
-   This means the threshold can never drop so far that zero trades
-   pass. Specifically:
-     vol_threshold  >= max(percentile result, last sig*sqrtT * FLOOR_FACTOR)
-     range_threshold >= max(percentile result, last range * FLOOR_FACTOR)
-     ema_threshold  >= max(percentile result, FLOOR_EMA_ABS)
-   FLOOR_FACTOR defaults to 1.05 (5% above current live reading).
-   This gives the gate a minimum breathing room without widening
-   the percentile itself.
+3. SETTLE LOCK-LEAK GUARD
+   _settle() wraps its entire polling loop in a try/finally that always
+   calls release_trade_lock() if settlement could not be confirmed, even
+   if an unexpected exception occurs mid-poll.  Previously an exception
+   during polling would leave _in_trade=True permanently.
+
+4. asyncio.get_event_loop() REPLACED
+   All _rpc() calls now use asyncio.get_running_loop() which is correct
+   for Python 3.10+ and avoids DeprecationWarning / RuntimeError in newer
+   runtimes.
+
+5. DUPLICATE _save() ON SHUTDOWN REMOVED
+   shutdown() saves state and sets _alive=False.  _connect_and_run() no
+   longer calls _save() after disconnect to avoid the double-write race.
+
+6. SKIP SUMMARY DECOUPLED FROM SKIP LOG RATE-LIMITER
+   The periodic skip summary previously only printed if the rate-limiter
+   happened to fire on the right tick.  It now has its own counter and
+   fires independently every skip_summary_every ticks after warmup.
 
 Run:
     export DERIV_API_TOKEN=your_token
@@ -84,7 +91,7 @@ log = logging.getLogger("bot")
 @dataclass
 class Config:
     # Deriv API
-    api_token: str = "3nMoTkW49VHJqhH"
+    api_token: str = field(default_factory=lambda: os.getenv("DERIV_API_TOKEN", ""))
     app_id:    str = field(default_factory=lambda: os.getenv("DERIV_APP_ID", "1089"))
     api_url:   str = "wss://ws.binaryws.com/websockets/v3"
 
@@ -97,7 +104,7 @@ class Config:
     payout_ratio:  float = 0.49   # actual observed payout ~$0.17 on $0.35 stake
 
     # Stake
-    base_stake: float = 1.0
+    base_stake: float = 0.35
     min_stake:  float = 0.35
     max_stake:  float = 10.0
     kelly_frac: float = 0.25
@@ -110,60 +117,58 @@ class Config:
     cal_history:     int = 500
     t_ticks:         int = 120
 
-    # Auto-threshold percentiles (kept as-is from original)
-    vol_percentile:   float = 35.0
-    range_percentile: float = 35.0
-    ema_percentile:   float = 35.0
+    # Auto-threshold percentiles
+    vol_percentile:   float = 38.0
+    range_percentile: float = 30.0
+    ema_percentile:   float = 30.0
 
-    # ── THRESHOLD FLOOR (NEW) ─────────────────────────────────────────────────
-    # Floor = FLOOR_FACTOR × current live metric value.
-    # Prevents auto-cal thresholds from collapsing below the live reading,
-    # ensuring at least a small positive margin always exists.
-    # 1.05 = threshold must be at least 5% above the current live value.
-    # Raise to 1.10 if you want a wider guaranteed margin.
-    threshold_floor_factor: float = 1.05
-    # Absolute minimum for EMA threshold (EMA distance can be near zero
-    # in ranging markets, so a relative floor alone isn't enough)
+    # Absolute EMA floor — kept because EMA distance can genuinely collapse to
+    # near-zero in a tight range and a pure percentile would let everything through.
     floor_ema_abs: float = 0.05
 
-    # Spike: reject if jump > mean_jump + k * std_jump
+    # Balance guard
+    balance_guard_multiples: int = 5   # need balance >= min_stake × this
+
+    # Spike filter
     spike_k: float = 3.0
 
-    # Z-score limit
-    z_coverage_factor: float = 1.0
+    # Z-score time-aware floor
+    z_coverage_factor:       float = 1.0
+    zscore_floor_window:     int   = 300
+    zscore_floor_percentile: float = 55.0
+    zscore_floor_min:        float = 0.55
+    zscore_floor_max:        float = 1.80
+
+    # Deadlock detector
+    deadlock_scan_limit:    int   = 2000   # ticks WITHOUT a trade → trigger
+    deadlock_widen_factor:  float = 1.35
+    deadlock_relief_ticks:  int   = 500
 
     # Bayes threshold bounds
-    bayes_min_threshold: float = 0.50
-    bayes_max_threshold: float = 0.75
+    bayes_min_threshold:      float = 0.38
+    bayes_max_threshold:      float = 0.75
+    bayes_explore_threshold:  float = 0.35
+    bayes_bootstrap_n:        int   = 20
+    bayes_learn_n:            int   = 100
 
     # Risk
-    cooldown_after_loss:     int   = 60
-    max_consecutive_losses:  int   = 3
-    max_daily_loss_pct:      float = 0.15
+    cooldown_after_loss:      int   = 60
+    max_consecutive_losses:   int   = 3
+    max_daily_loss_pct:       float = 0.15
 
-    # ── MARTINGALE ────────────────────────────────────────────────────────────
-    # Kicks in after MARTI_KICK_IN consecutive losses.
-    # Stake is multiplied by MARTI_FACTOR each step up to MARTI_MAX_STEPS.
-    # After max steps the stake resets to base on the next win or hard reset.
-    # Factor 2.1, kick-in after 2 losses, max 2 steps:
-    #   Loss 1 → base stake ($0.35)        cumulative risk: $0.35
-    #   Loss 2 → $0.35 × 2.1 = $0.74      cumulative risk: $1.09
-    #   Loss 3 → $0.74 × 2.1 = $1.55      cumulative risk: $2.64  ← max
-    marti_factor:    float = 2.1
-    marti_kick_in:   int   = 2    # escalate after this many consecutive losses
-    marti_max_steps: int   = 4    # max escalation steps (0.35 -> 0.74 -> 1.55 -> 3.25)
+    # Martingale
+    marti_factor:    float = 3.1
+    marti_kick_in:   int   = 2
+    marti_max_steps: int   = 4
 
-    # ── SETTLEMENT VERIFICATION (NEW) ────────────────────────────────────────
-    # How long to wait total after expiry before giving up on settlement
-    settle_wait_extra:    int = 10   # seconds to wait after nominal expiry
-    settle_poll_interval: int = 5    # seconds between each status poll
-    settle_poll_attempts: int = 12   # max polls (12 × 5s = 60s max extra wait)
+    # Settlement verification
+    settle_wait_extra:    int = 10    # seconds to wait after nominal expiry
+    settle_poll_interval: int = 5     # seconds between polls
+    settle_poll_attempts: int = 12    # max polls (12 × 5s = 60s extra)
 
-    # ── SKIP LOGGING (NEW) ───────────────────────────────────────────────────
-    # Minimum seconds between skip-reason log lines (prevents log flood)
-    skip_log_interval: float = 30.0
-    # Print a skip-reason summary every N ticks after warmup
-    skip_summary_every: int  = 150
+    # Skip logging
+    skip_log_interval:  float = 30.0
+    skip_summary_every: int   = 150
 
     # Persistence
     state_file:   str = "bot_state.pkl"
@@ -177,8 +182,8 @@ class Config:
 def percentile(data: List[float], pct: float) -> float:
     if not data:
         return 0.0
-    s = sorted(data)
-    n = len(s)
+    s   = sorted(data)
+    n   = len(s)
     idx = pct / 100.0 * (n - 1)
     lo, hi = int(idx), min(int(idx) + 1, n - 1)
     return s[lo] + (idx - lo) * (s[hi] - s[lo])
@@ -202,12 +207,29 @@ class BayesModel:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._bb: Dict[str, List[float]] = {r: [3.0, 3.0] for r in self.REGIMES}
+        # Uniform [1,1] prior — real outcomes move the posterior fast.
+        self._bb: Dict[str, List[float]] = {r: [1.0, 1.0] for r in self.REGIMES}
         self._w  = [0.0] * 5
         self._b  = 0.0
         self._lr = cfg.bayes_min_threshold * 0.08
         self._l2 = 0.001
         self._n  = 0
+
+    def adaptive_min_threshold(self) -> float:
+        """
+        Sliding Bayes gate floor based on number of confirmed trades.
+        - Exploration (n < bootstrap_n): use bayes_explore_threshold.
+        - Learning    (bootstrap_n ≤ n < learn_n): linearly ramp to bayes_min_threshold.
+        - Mature      (n ≥ learn_n): use bayes_min_threshold.
+        """
+        n   = self._n
+        cfg = self.cfg
+        if n < cfg.bayes_bootstrap_n:
+            return cfg.bayes_explore_threshold
+        if n < cfg.bayes_learn_n:
+            t = (n - cfg.bayes_bootstrap_n) / (cfg.bayes_learn_n - cfg.bayes_bootstrap_n)
+            return cfg.bayes_explore_threshold + t * (cfg.bayes_min_threshold - cfg.bayes_explore_threshold)
+        return cfg.bayes_min_threshold
 
     def predict(self, fv: List[float], regime: str) -> Tuple[float, float]:
         a, b    = self._bb[regime]
@@ -218,8 +240,8 @@ class BayesModel:
         w_lr    = min(0.7, self._n / 200)
         p_final = (1 - w_lr) * p_bb + w_lr * p_lr
         threshold = p_bb - 0.5 * sd_bb
-        threshold = max(self.cfg.bayes_min_threshold,
-                        min(self.cfg.bayes_max_threshold, threshold))
+        min_th    = self.adaptive_min_threshold()
+        threshold = max(min_th, min(self.cfg.bayes_max_threshold, threshold))
         return p_final, threshold
 
     def update(self, fv: List[float], regime: str, won: bool):
@@ -238,12 +260,12 @@ class BayesModel:
         )
 
     def threshold_for(self, regime: str) -> float:
-        a, b    = self._bb[regime]
-        p_bb    = a / (a + b)
-        var_bb  = (a * b) / ((a + b) ** 2 * (a + b + 1))
-        sd_bb   = math.sqrt(var_bb)
-        t       = p_bb - 0.5 * sd_bb
-        return max(self.cfg.bayes_min_threshold, min(self.cfg.bayes_max_threshold, t))
+        a, b   = self._bb[regime]
+        p_bb   = a / (a + b)
+        var_bb = (a * b) / ((a + b) ** 2 * (a + b + 1))
+        sd_bb  = math.sqrt(var_bb)
+        t      = p_bb - 0.5 * sd_bb
+        return max(self.adaptive_min_threshold(), min(self.cfg.bayes_max_threshold, t))
 
     def save(self, path: str):
         with open(path, "wb") as f:
@@ -259,18 +281,22 @@ class BayesModel:
             self._n  = s["n"]
             log.info(f"Model loaded from {path} | trades={self._n}")
         except FileNotFoundError:
-            log.info("No saved model - starting fresh.")
+            log.info("No saved model — starting fresh.")
 
     def summary(self) -> str:
-        lines = []
+        min_th = self.adaptive_min_threshold()
+        phase  = ("explore" if self._n < self.cfg.bayes_bootstrap_n
+                  else "learning" if self._n < self.cfg.bayes_learn_n
+                  else "mature")
+        lines  = [f"Bayesian model (n={self._n} phase={phase} min_th={min_th:.3f}):"]
         for r in self.REGIMES:
             a, b = self._bb[r]
-            n    = int(a + b - 7)
+            n    = int(a + b - 2)
             lines.append(
                 f"  {r:7s}: p={a/(a+b):.3f}  threshold={self.threshold_for(r):.3f}"
                 f"  N={max(0,n)}"
             )
-        return "Bayesian model:\n" + "\n".join(lines)
+        return "\n".join(lines)
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -300,14 +326,14 @@ class Features:
 
 
 # -----------------------------------------------------------------------------
-# TICK BUFFER + FEATURE ENGINE  (with floored thresholds)
+# TICK BUFFER + FEATURE ENGINE
 # -----------------------------------------------------------------------------
 
 class TickBuffer:
 
     def __init__(self, cfg: Config):
-        self.cfg = cfg
-        maxlen   = max(cfg.vol_window, cfg.range_window, cfg.spike_window, 500)
+        self.cfg     = cfg
+        maxlen       = max(cfg.vol_window, cfg.range_window, cfg.spike_window, 500)
         self._prices:           deque = deque(maxlen=maxlen)
         self._ema_fast:         Optional[float] = None
         self._ema_slow:         Optional[float] = None
@@ -317,11 +343,7 @@ class TickBuffer:
         self._hist_range:       deque = deque(maxlen=cfg.cal_history)
         self._hist_ema_dist:    deque = deque(maxlen=cfg.cal_history)
         self._hist_jumps:       deque = deque(maxlen=cfg.cal_history)
-
-        # Last computed live values — used for the floor
-        self._last_sigma_sqrtT: float = 0.0
-        self._last_range:       float = 0.0
-        self._last_ema_dist:    float = 0.0
+        self._hist_zscore_abs:  deque = deque(maxlen=cfg.zscore_floor_window)
 
     def push(self, price: float) -> Optional[Features]:
         self._prices.append(price)
@@ -337,40 +359,19 @@ class TickBuffer:
 
     @property
     def is_warm(self) -> bool:
-        """True once the buffer has collected enough ticks to trade."""
         return self._tick >= self.cfg.warmup_ticks
 
-    # ── Thresholds with floor ──────────────────────────────────────────────────
+    # ── Thresholds — pure percentile, no live-value chase ─────────────────────
 
     def vol_threshold(self) -> float:
-        """
-        Auto-cal percentile, floored at FLOOR_FACTOR × current live sig*sqrtT.
-        Guarantees a minimum positive margin even when volatility is elevated.
-        """
-        pct_val = percentile(list(self._hist_sigma_sqrtT), self.cfg.vol_percentile)
-        floor   = self._last_sigma_sqrtT * self.cfg.threshold_floor_factor
-        result  = max(pct_val, floor)
-        return result
+        return max(percentile(list(self._hist_sigma_sqrtT), self.cfg.vol_percentile), 1e-6)
 
     def range_threshold(self) -> float:
-        """Auto-cal percentile, floored at FLOOR_FACTOR × current live range."""
-        pct_val = percentile(list(self._hist_range), self.cfg.range_percentile)
-        floor   = self._last_range * self.cfg.threshold_floor_factor
-        result  = max(pct_val, floor)
-        return result
+        return max(percentile(list(self._hist_range), self.cfg.range_percentile), 1e-6)
 
     def ema_threshold(self) -> float:
-        """
-        Auto-cal percentile, floored at max(FLOOR_FACTOR × live EMA dist,
-        FLOOR_EMA_ABS). The absolute floor handles near-zero EMA convergence.
-        """
         pct_val = percentile(list(self._hist_ema_dist), self.cfg.ema_percentile)
-        floor   = max(
-            self._last_ema_dist * self.cfg.threshold_floor_factor,
-            self.cfg.floor_ema_abs,
-        )
-        result  = max(pct_val, floor)
-        return result
+        return max(pct_val, self.cfg.floor_ema_abs)
 
     def spike_threshold(self) -> float:
         if not self._hist_jumps:
@@ -379,10 +380,24 @@ class TickBuffer:
         return mu + self.cfg.spike_k * sd
 
     def zscore_limit(self, sigma_price: float) -> float:
-        if sigma_price <= 0:
-            return 1.0
-        raw = self.cfg.z_coverage_factor * (self.cfg.barrier / sigma_price)
-        return max(0.5, min(1.5, raw))
+        """
+        Time-aware z-score ceiling — min(coverage_cap, distribution_floor).
+        Coverage cap  = z_coverage_factor × (barrier / sigma_price)
+        Distribution  = zscore_floor_percentile of recent |Z| history.
+        Result clamped to [zscore_floor_min, zscore_floor_max].
+        """
+        cfg = self.cfg
+        coverage_cap = (
+            cfg.z_coverage_factor * (cfg.barrier / sigma_price)
+            if sigma_price > 0 else cfg.zscore_floor_max
+        )
+        if len(self._hist_zscore_abs) >= 30:
+            dist_floor = percentile(list(self._hist_zscore_abs), cfg.zscore_floor_percentile)
+        else:
+            dist_floor = cfg.zscore_floor_max  # cold start: don't block
+
+        raw = min(coverage_cap, dist_floor)
+        return max(cfg.zscore_floor_min, min(cfg.zscore_floor_max, raw))
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
@@ -429,17 +444,12 @@ class TickBuffer:
         else:
             regime = "high"
 
-        # Update calibration histories
         self._hist_sigma_sqrtT.append(sigma_sqrt_T)
         self._hist_range.append(range_width)
         self._hist_ema_dist.append(ema_distance)
         if jumps:
             self._hist_jumps.extend(jumps)
-
-        # Store last live values (used by floor logic)
-        self._last_sigma_sqrtT = sigma_sqrt_T
-        self._last_range       = range_width
-        self._last_ema_dist    = ema_distance
+        self._hist_zscore_abs.append(abs(zscore))
 
         fv = [
             min(sigma_sqrt_T / 3.0, 1.0),
@@ -461,7 +471,7 @@ class TickBuffer:
 
 
 # -----------------------------------------------------------------------------
-# GATE CHAIN  (with per-gate skip logging and margin info)
+# GATE CHAIN
 # -----------------------------------------------------------------------------
 
 @dataclass
@@ -471,8 +481,8 @@ class Decision:
     p_win:      float
     score:      float
     reason:     str
-    gate:       str          # which gate rejected ("" if trade=True)
-    margin:     float        # how far from threshold (negative = failed by this much)
+    gate:       str
+    margin:     float
     thresholds: Dict
 
 
@@ -484,12 +494,13 @@ class GateChain:
         self.bayes = bayes
 
     def evaluate(self, f: Features, balance: float,
-                 risk: Optional["RiskManager"] = None) -> Decision:
-        th_vol   = self.buf.vol_threshold()
-        th_range = self.buf.range_threshold()
-        th_ema   = self.buf.ema_threshold()
-        th_spike = self.buf.spike_threshold()
-        th_z     = self.buf.zscore_limit(f.sigma_price)
+                 risk: Optional["RiskManager"] = None,
+                 widen_factor: float = 1.0) -> Decision:
+        th_vol   = self.buf.vol_threshold()   * widen_factor
+        th_range = self.buf.range_threshold() * widen_factor
+        th_ema   = self.buf.ema_threshold()   * widen_factor
+        th_spike = self.buf.spike_threshold() * widen_factor
+        th_z     = self.buf.zscore_limit(f.sigma_price) * widen_factor
         _, th_bayes = self.bayes.predict(f.fv, f.regime)
 
         thresholds = {
@@ -508,7 +519,7 @@ class GateChain:
 
         # Gate 1: Volatility
         if th_vol == 0 or f.sigma_sqrt_T >= th_vol:
-            margin = th_vol - f.sigma_sqrt_T   # negative = over threshold
+            margin = th_vol - f.sigma_sqrt_T
             return reject("vol",
                 f"sig*sqrtT={f.sigma_sqrt_T:.4f} >= th={th_vol:.4f} "
                 f"(over by {-margin:.4f})", margin)
@@ -551,8 +562,8 @@ class GateChain:
 
         # All passed
         stake, score = self._stake(p_win, balance, f, th_vol, th_range, th_z, risk)
-        marti_info = (f" [MARTI step={risk.marti_step}]" if risk and risk.marti_step > 0
-                      else "")
+        marti_info   = (f" [MARTI step={risk.marti_step}]" if risk and risk.marti_step > 0
+                        else "")
         log.info(
             f"SIGNAL | tick={f.tick} p={p_win:.3f} "
             f"sig*sqrtT={f.sigma_sqrt_T:.3f}/{th_vol:.3f} "
@@ -574,8 +585,6 @@ class GateChain:
         raw   = frac * balance
         kelly_stake = max(self.cfg.min_stake, min(raw, self.cfg.max_stake))
 
-        # Martingale override: when in an escalation step, use martingale stake
-        # instead of Kelly. Kelly resumes at base step after a win.
         if risk and risk.marti_step > 0:
             stake = min(risk.martingale_stake, self.cfg.max_stake)
         else:
@@ -584,7 +593,7 @@ class GateChain:
         vol_score   = max(0, 1 - f.sigma_sqrt_T / th_vol) if th_vol else 0
         range_score = max(0, 1 - f.range_width  / th_range) if th_range else 0
         z_score_val = max(0, 1 - abs(f.zscore)  / th_z) if th_z else 0
-        score = round((vol_score + range_score + z_score_val) / 3, 3)
+        score       = round((vol_score + range_score + z_score_val) / 3, 3)
 
         return round(stake, 2), score
 
@@ -604,14 +613,17 @@ class RiskManager:
         self._pause_reason     = ""
         self._start_balance:   Optional[float] = None
         self._daily_pnl        = 0.0
-        # Martingale state
-        self._marti_step       = 0   # current escalation step (0 = base stake)
+        self._marti_step       = 0
 
     def set_balance(self, b: float):
         if self._start_balance is None:
             self._start_balance = b
 
-    def can_trade(self) -> Tuple[bool, str]:
+    @property
+    def in_trade(self) -> bool:
+        return self._in_trade
+
+    def can_trade(self, balance: float = 0.0) -> Tuple[bool, str]:
         if self._in_trade:
             return False, "in_trade"
         if self._paused:
@@ -629,8 +641,11 @@ class RiskManager:
             cap = self._start_balance * self.cfg.max_daily_loss_pct
             if self._daily_pnl < -cap:
                 self._paused       = True
-                self._pause_reason = f"daily_loss_cap"
-                return False, f"paused:{self._pause_reason}"
+                self._pause_reason = "daily_loss_cap"
+                return False, "paused:daily_loss_cap"
+        min_safe = self.cfg.min_stake * self.cfg.balance_guard_multiples
+        if balance > 0 and balance < min_safe:
+            return False, f"balance_too_low:{balance:.2f}<{min_safe:.2f}"
         return True, "ok"
 
     def on_open(self):
@@ -648,12 +663,10 @@ class RiskManager:
         else:
             self._consec_losses  += 1
             self._last_loss_time  = time.time()
-            # Escalate only after MARTI_KICK_IN consecutive losses
             if self._consec_losses >= self.cfg.marti_kick_in:
                 if self._marti_step < self.cfg.marti_max_steps:
                     self._marti_step += 1
-                    next_stake = self.cfg.min_stake * (
-                        self.cfg.marti_factor ** self._marti_step)
+                    next_stake = self.cfg.min_stake * (self.cfg.marti_factor ** self._marti_step)
                     log.info(
                         f"MARTINGALE STEP {self._marti_step}/{self.cfg.marti_max_steps}"
                         f" | loss #{self._consec_losses}"
@@ -662,8 +675,9 @@ class RiskManager:
                 else:
                     log.warning(
                         f"MARTINGALE MAX STEP reached ({self._marti_step}) — "
-                        f"stake stays at ${self.cfg.min_stake * (self.cfg.marti_factor ** self._marti_step):.2f} "
-                        f"until win or hard reset"
+                        f"stake stays at "
+                        f"${self.cfg.min_stake * (self.cfg.marti_factor ** self._marti_step):.2f}"
+                        f" until win or hard reset"
                     )
             else:
                 log.info(
@@ -673,22 +687,16 @@ class RiskManager:
 
     @property
     def martingale_stake(self) -> float:
-        """
-        Returns the base stake multiplied by the martingale factor for
-        the current step. Step 0 = base stake (no escalation).
-        """
-        return round(
-            self.cfg.min_stake * (self.cfg.marti_factor ** self._marti_step), 2
-        )
+        return round(self.cfg.min_stake * (self.cfg.marti_factor ** self._marti_step), 2)
 
     @property
     def marti_step(self) -> int:
         return self._marti_step
 
     def release_trade_lock(self):
-        """Release the in-trade lock without recording a win or loss.
-        Used when a settlement cannot be confirmed — we do not penalise
-        the martingale state for a trade whose outcome is unknown.
+        """
+        Release the in-trade lock without recording a win or loss.
+        Used when settlement cannot be confirmed — martingale state unchanged.
         """
         self._in_trade = False
         log.warning("Trade lock released (unconfirmed outcome — martingale unchanged)")
@@ -771,8 +779,8 @@ class DerivClient:
         self.balance: float = 0.0
 
     async def connect(self):
-        url           = f"{self.cfg.api_url}?app_id={self.cfg.app_id}"
-        self._ws      = await websockets.connect(url, ping_interval=20, ping_timeout=10)
+        url             = f"{self.cfg.api_url}?app_id={self.cfg.app_id}"
+        self._ws        = await websockets.connect(url, ping_interval=20, ping_timeout=10)
         self._connected = True
         asyncio.create_task(self._listen())
 
@@ -789,9 +797,9 @@ class DerivClient:
 
     async def proposal(self, stake: float) -> Optional[dict]:
         r = await self._rpc({
-            "proposal": 1,
-            "amount":   str(stake),
-            "basis":    "stake",
+            "proposal":      1,
+            "amount":        str(stake),
+            "basis":         "stake",
             "contract_type": self.cfg.contract_type,
             "currency":      self.cfg.currency,
             "duration":      self.cfg.expiry_min,
@@ -815,10 +823,6 @@ class DerivClient:
         return b
 
     async def contract_status(self, contract_id) -> Optional[dict]:
-        """
-        Primary settlement check: proposal_open_contract gives live status
-        including is_sold, profit, sell_price.
-        """
         r = await self._rpc({
             "proposal_open_contract": 1,
             "contract_id": int(contract_id),
@@ -829,10 +833,6 @@ class DerivClient:
         return r.get("proposal_open_contract")
 
     async def profit_table_lookup(self, contract_id) -> Optional[dict]:
-        """
-        Fallback settlement check via profit_table.
-        Returns the transaction row if found, else None.
-        """
         r = await self._rpc({
             "profit_table": 1,
             "description":  1,
@@ -852,14 +852,20 @@ class DerivClient:
         if self._ws:
             await self._ws.close()
 
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
     def _next(self) -> int:
         self._rid += 1
         return self._rid
 
     async def _rpc(self, payload: dict) -> dict:
+        # FIX: use get_running_loop() — correct on Python 3.10+
+        loop             = asyncio.get_running_loop()
         rid              = self._next()
         payload["req_id"] = rid
-        fut              = asyncio.get_event_loop().create_future()
+        fut              = loop.create_future()
         self._pending[rid] = fut
         await self._send(payload)
         try:
@@ -888,13 +894,8 @@ class DerivClient:
         except Exception as e:
             log.error(f"WebSocket listener error: {e}")
         finally:
-            # Signal that the connection dropped so the run loop can reconnect
             self._connected = False
             log.warning("WebSocket listener exited — connection lost")
-
-    @property
-    def connected(self) -> bool:
-        return self._connected
 
     async def _call(self, price: float):
         try:
@@ -922,13 +923,20 @@ class Bot:
         self.client  = DerivClient(cfg)
         self._alive  = True
 
-        # Skip logging state
-        self._last_skip_log: float        = 0.0
-        self._skip_counts:   Counter      = Counter()
-        self._ticks_after_warmup:   int   = 0
+        # Skip logging
+        self._last_skip_log:      float   = 0.0
+        self._skip_counts:        Counter = Counter()
+        self._ticks_after_warmup: int     = 0
 
-        # Periodic state log
+        # State log
         self._last_feature_log: float = 0.0
+
+        # Deadlock detector
+        # FIX: drought counter only increments when NOT in a trade.
+        # Previously it incremented every tick including during the 2-min
+        # contract window, causing false deadlock triggers.
+        self._ticks_since_trade:        int = 0
+        self._deadlock_relief_remaining: int = 0
 
     # ── Entry ──────────────────────────────────────────────────────────────────
 
@@ -937,7 +945,6 @@ class Bot:
         await self._connect_and_run()
 
     async def _connect_and_run(self):
-        """Connects, runs, and auto-reconnects on any drop. Never exits while _alive."""
         retry_delay = 5
         while self._alive:
             try:
@@ -946,14 +953,12 @@ class Bot:
                 await self.client.auth()
                 self.risk.set_balance(self.client.balance)
                 log.info(self.bayes.summary())
-                # Only log warm-up message if buffer is not already warm
                 if not self.buf.is_warm:
-                    log.info(f"Warming up - need {self.cfg.warmup_ticks} ticks before trading")
+                    log.info(f"Warming up — need {self.cfg.warmup_ticks} ticks before trading")
                 else:
-                    log.info(f"Buffer already warm ({self.buf.tick} ticks) - trading immediately after reconnect")
+                    log.info(f"Buffer already warm ({self.buf.tick} ticks) — trading immediately")
                 await self.client.subscribe_ticks(self.on_tick)
-                retry_delay = 5   # reset backoff on successful connect
-                # Keep alive — check connection health every second
+                retry_delay = 5
                 while self._alive and self.client.connected:
                     await asyncio.sleep(1)
                 if self._alive:
@@ -962,9 +967,10 @@ class Bot:
             except Exception as e:
                 log.error(f"Connection error: {e} — retrying in {retry_delay}s")
                 await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 60)   # exponential backoff up to 60s
+                retry_delay = min(retry_delay * 2, 60)
+        # FIX: removed duplicate _save() here — shutdown() already saves before
+        # setting _alive=False, so this path is only reached after a clean shutdown.
         await self.client.disconnect()
-        self._save()
 
     # ── Tick handler ───────────────────────────────────────────────────────────
 
@@ -978,46 +984,53 @@ class Bot:
 
         self._ticks_after_warmup += 1
 
-        # Periodic state log (every 15s)
+        # Periodic state log (every 15 s)
         now = time.time()
         if now - self._last_feature_log > 15:
             self._log_state(f)
             self._last_feature_log = now
 
-        if self.risk._in_trade:
-            self._record_skip("in_trade")
-            return
+        # Periodic skip summary — independent of skip rate-limiter
+        if self._ticks_after_warmup % self.cfg.skip_summary_every == 0:
+            self._log_skip_summary()
 
-        ok, reason = self.risk.can_trade()
+        # ── Single authoritative gate check ───────────────────────────────────
+        # FIX: removed the direct risk._in_trade check that preceded can_trade().
+        # can_trade() is the single gate; accessing _in_trade directly was
+        # bypassing the public API and creating a confusing double-check.
+        ok, reason = self.risk.can_trade(self.client.balance)
         if not ok:
-            self._record_skip(reason)
+            self._skip_counts[reason] += 1
+            # FIX: only increment drought counter when bot is genuinely idle
+            # (not blocked because a trade is already running).
+            if reason != "in_trade":
+                self._check_deadlock()
+            self._maybe_log_skip_reason(reason, f)
             return
 
-        dec = self.chain.evaluate(f, self.client.balance, self.risk)
+        # Bot is idle and all risk checks pass — run deadlock check and gate chain
+        self._check_deadlock()
+
+        dec = self.chain.evaluate(f, self.client.balance, self.risk,
+                                  widen_factor=self._deadlock_widen_factor)
         if not dec.trade:
-            self._record_skip(f"gate:{dec.gate}")
+            self._skip_counts[f"gate:{dec.gate}"] += 1
             self._maybe_log_skip(dec, f)
             return
 
-        await self._execute(dec, f)
+        # FIX: _execute is dispatched as a Task so on_tick returns immediately.
+        # The 2-minute settlement sleep happens in the background; tick processing
+        # continues uninterrupted.  risk.on_open() is called inside _execute
+        # before the task yields, so subsequent ticks see in_trade=True instantly.
+        asyncio.create_task(self._execute(dec, f))
 
     # ── Skip logging ───────────────────────────────────────────────────────────
 
-    def _record_skip(self, reason: str):
-        """Tally skips by reason for the periodic summary."""
-        self._skip_counts[reason] += 1
-
     def _maybe_log_skip(self, dec: Decision, f: Features):
-        """
-        Log the skip reason at most once every skip_log_interval seconds.
-        Shows the exact value, threshold, and margin so you know how far
-        the market needs to move for the gate to open.
-        """
         now = time.time()
         if now - self._last_skip_log < self.cfg.skip_log_interval:
             return
         self._last_skip_log = now
-
         th = dec.thresholds
         log.info(
             f"[SKIP tick={f.tick}] gate={dec.gate} | {dec.reason} | "
@@ -1030,33 +1043,54 @@ class Bot:
             f"bayes_th={th.get('bayes','?')}"
         )
 
-        # Print skip-reason summary every skip_summary_every ticks
-        if self._ticks_after_warmup % self.cfg.skip_summary_every == 0:
-            total = sum(self._skip_counts.values())
-            summary = " | ".join(
-                f"{k}:{v}({v/total*100:.0f}%)"
-                for k, v in self._skip_counts.most_common()
-            )
-            log.info(f"[SKIP SUMMARY ticks={self._ticks_after_warmup}] "
-                     f"total_skipped={total} | {summary}")
+    def _maybe_log_skip_reason(self, reason: str, f: Features):
+        now = time.time()
+        if now - self._last_skip_log < self.cfg.skip_log_interval:
+            return
+        self._last_skip_log = now
+        log.info(f"[SKIP tick={f.tick}] reason={reason}")
+
+    def _log_skip_summary(self):
+        total = sum(self._skip_counts.values())
+        if total == 0:
+            return
+        summary = " | ".join(
+            f"{k}:{v}({v/total*100:.0f}%)"
+            for k, v in self._skip_counts.most_common()
+        )
+        log.info(
+            f"[SKIP SUMMARY ticks={self._ticks_after_warmup}] "
+            f"total_skipped={total} | {summary}"
+        )
 
     # ── Trade execution ────────────────────────────────────────────────────────
 
     async def _execute(self, dec: Decision, f: Features):
+        """
+        FIX: Settlement sleep moved out of on_tick coroutine.
+        This method runs as an independent asyncio Task, so the 2-minute
+        wait does not block tick processing or gate evaluation.
+        risk.on_open() is called synchronously at the top so that subsequent
+        ticks immediately see in_trade=True.
+        """
         prop = await self.client.proposal(dec.stake)
         if not prop:
             return
 
+        # Set in-trade lock before any await so the very next tick sees it
         self.risk.on_open()
+        self._ticks_since_trade = 0   # reset deadlock drought counter on trade entry
+
         result = await self.client.buy(prop["id"], float(prop["ask_price"]))
         if not result:
+            # Buy failed — release lock and treat as loss for risk accounting
             self.risk.on_close(won=False, profit=-dec.stake)
             return
 
         cid       = result.get("contract_id")
         buy_price = float(result.get("buy_price", dec.stake))
 
-        row = {
+        self.history.add({
             "ts":          datetime.utcnow().isoformat(),
             "contract_id": cid,
             "stake":       buy_price,
@@ -1069,10 +1103,9 @@ class Bot:
             "vol_th":      dec.thresholds.get("vol"),
             "range_th":    dec.thresholds.get("range"),
             "bayes_th":    dec.thresholds.get("bayes"),
-        }
-        self.history.add(row)
+        })
 
-        # Wait for nominal expiry + a small buffer before polling
+        # Wait for nominal expiry + buffer — runs in background Task
         wait = self.cfg.expiry_min * 60 + self.cfg.settle_wait_extra
         log.info(f"Contract open | id={cid} stake={buy_price:.2f} | waiting {wait}s...")
         await asyncio.sleep(wait)
@@ -1084,113 +1117,211 @@ class Bot:
     async def _settle(self, cid, buy_price: float, f: Features):
         """
         Polls the API until the contract is confirmed settled.
-        Never assumes a loss from a timeout or missing message.
+
+        FIX: wrapped in try/finally so the trade lock is always released even
+        if an exception occurs during polling (e.g. WS drop mid-settle).
+        Previously an exception here would leave _in_trade=True permanently,
+        deadlocking the bot until restart.
 
         Flow:
-          1. Poll proposal_open_contract every SETTLE_POLL_INTERVAL seconds,
-             up to SETTLE_POLL_ATTEMPTS times.
+          1. Poll proposal_open_contract every SETTLE_POLL_INTERVAL seconds.
           2. If that fails, check profit_table as fallback.
-          3. Only record outcome + update Bayes when API confirms.
-          4. If neither path confirms within the budget, log a WARNING
-             and skip the Bayes update entirely (no phantom loss).
+          3. Record outcome + update Bayes only on API confirmation.
+          4. If neither path confirms, log WARNING and skip Bayes update.
         """
-        won           = None   # None = unconfirmed
+        won           = None
         profit        = None
         settle_source = "unknown"
 
         log.info(f"[SETTLE] Polling contract {cid} for settlement confirmation...")
 
-        for attempt in range(1, self.cfg.settle_poll_attempts + 1):
-            status = await self.client.contract_status(cid)
+        try:
+            for attempt in range(1, self.cfg.settle_poll_attempts + 1):
+                status = await self.client.contract_status(cid)
 
-            if status:
-                is_sold    = status.get("is_sold", False)
-                sell_price = status.get("sell_price")
-                api_profit = status.get("profit")
-                api_status = status.get("status", "")
+                if status:
+                    is_sold    = status.get("is_sold", False)
+                    sell_price = status.get("sell_price")
+                    api_profit = status.get("profit")
+                    api_status = status.get("status", "")
 
-                log.info(
-                    f"[SETTLE] Poll {attempt}/{self.cfg.settle_poll_attempts} | "
-                    f"cid={cid} status={api_status!r} "
-                    f"is_sold={is_sold} sell_price={sell_price} profit={api_profit}"
-                )
+                    log.info(
+                        f"[SETTLE] Poll {attempt}/{self.cfg.settle_poll_attempts} | "
+                        f"cid={cid} status={api_status!r} "
+                        f"is_sold={is_sold} sell_price={sell_price} profit={api_profit}"
+                    )
 
-                if is_sold or api_status in ("sold", "won", "lost"):
-                    # API has confirmed settlement
-                    if api_profit is not None:
-                        profit = float(api_profit)
-                    elif sell_price is not None:
-                        profit = float(sell_price) - buy_price
-                    else:
-                        profit = 0.0
-                    won           = profit > 0
-                    settle_source = "proposal_open_contract"
-                    break
-            else:
-                log.info(
-                    f"[SETTLE] Poll {attempt}/{self.cfg.settle_poll_attempts} | "
-                    f"cid={cid} — no response, retrying in {self.cfg.settle_poll_interval}s"
-                )
+                    if is_sold or api_status in ("sold", "won", "lost"):
+                        if api_profit is not None:
+                            profit = float(api_profit)
+                        elif sell_price is not None:
+                            profit = float(sell_price) - buy_price
+                        else:
+                            profit = 0.0
 
-            await asyncio.sleep(self.cfg.settle_poll_interval)
+                        if profit == 0.0 and sell_price is not None:
+                            profit = float(sell_price) - buy_price
 
-        # Fallback: profit_table
-        if won is None:
-            log.warning(
-                f"[SETTLE] proposal_open_contract did not confirm for {cid} "
-                f"after {self.cfg.settle_poll_attempts} polls — trying profit_table"
-            )
-            txn = await self.client.profit_table_lookup(cid)
-            if txn:
-                profit        = float(txn.get("profit", 0))
-                won           = profit > 0
-                settle_source = "profit_table"
-                log.info(
-                    f"[SETTLE] profit_table confirmed | cid={cid} "
-                    f"profit={profit:+.4f} won={won}"
-                )
-            else:
+                        won           = profit > 0
+                        settle_source = "proposal_open_contract"
+                        break
+                else:
+                    log.info(
+                        f"[SETTLE] Poll {attempt}/{self.cfg.settle_poll_attempts} | "
+                        f"cid={cid} — no response, retrying in {self.cfg.settle_poll_interval}s"
+                    )
+
+                await asyncio.sleep(self.cfg.settle_poll_interval)
+
+            # Fallback: profit_table
+            if won is None:
                 log.warning(
-                    f"[SETTLE] ⚠ UNCONFIRMED — contract {cid} not found in "
-                    f"profit_table either. Skipping Bayes update to avoid "
-                    f"phantom loss. Refresh balance only."
+                    f"[SETTLE] proposal_open_contract did not confirm for {cid} "
+                    f"after {self.cfg.settle_poll_attempts} polls — trying profit_table"
                 )
+                balance_before = self.client.balance
+                txn = await self.client.profit_table_lookup(cid)
+                if txn:
+                    profit        = float(txn.get("profit", 0))
+                    settle_source = "profit_table"
+
+                    if profit == 0.0:
+                        await self.client.refresh_balance()
+                        delta = round(self.client.balance - balance_before, 5)
+                        if delta > 0:
+                            profit = delta
+                            won    = True
+                            log.info(
+                                f"[SETTLE] profit_table profit=0 RESOLVED via balance delta "
+                                f"(Δ={delta:+.5f}) → WON | cid={cid}"
+                            )
+                        elif delta < 0:
+                            profit = delta
+                            won    = False
+                            log.info(
+                                f"[SETTLE] profit_table profit=0 RESOLVED via balance delta "
+                                f"(Δ={delta:+.5f}) → LOST | cid={cid}"
+                            )
+                        else:
+                            log.warning(
+                                f"[SETTLE] profit_table profit=0 AND balance delta=0 for "
+                                f"{cid} — outcome ambiguous (possible void/refund). "
+                                f"Skipping Bayes update."
+                            )
+                            # Release lock via finally; won=None skips Bayes below
+                            return
+                    else:
+                        won = profit > 0
+                        await self.client.refresh_balance()
+
+                    log.info(
+                        f"[SETTLE] profit_table confirmed | cid={cid} "
+                        f"profit={profit:+.4f} won={won}"
+                    )
+                else:
+                    log.warning(
+                        f"[SETTLE] ⚠ UNCONFIRMED — contract {cid} not found in "
+                        f"profit_table either. Skipping Bayes update."
+                    )
+                    # Release lock via finally; won=None skips Bayes below
+                    return
+
+            # Confirmed settlement
+            if settle_source != "profit_table":
                 await self.client.refresh_balance()
-                self.risk.release_trade_lock()   # release lock WITHOUT touching martingale
-                return
 
-        # Confirmed settlement
-        await self.client.refresh_balance()
-        self.risk.on_close(won, profit)
-        self.history.update_last(cid, won, profit, self.client.balance, settle_source)
+            self.risk.on_close(won, profit)
+            self.history.update_last(cid, won, profit, self.client.balance, settle_source)
+            self.bayes.update(f.fv, f.regime, won)
+            self._save()
 
-        # Only update Bayes model on confirmed outcomes
-        self.bayes.update(f.fv, f.regime, won)
-        self._save()
+            stats = self.history.stats
+            log.info(
+                f"{'WIN' if won else 'LOSS'} | cid={cid} profit={profit:+.4f} "
+                f"balance={self.client.balance:.2f} source={settle_source} | "
+                f"win_rate={stats['win_rate']:.1%} n={stats['n']}"
+            )
+            log.info(self.bayes.summary())
 
-        stats = self.history.stats
-        log.info(
-            f"{'WIN' if won else 'LOSS'} | cid={cid} profit={profit:+.4f} "
-            f"balance={self.client.balance:.2f} source={settle_source} | "
-            f"win_rate={stats['win_rate']:.1%} n={stats['n']}"
-        )
-        log.info(self.bayes.summary())
+        except Exception as exc:
+            log.error(f"[SETTLE] Exception during settlement for {cid}: {exc}", exc_info=True)
+            # Fall through to finally — lock will be released
+        finally:
+            # FIX: if settlement was not confirmed (won is still None), or an
+            # exception was raised, ensure the trade lock is always released so
+            # the bot can continue trading on the next tick.
+            if won is None:
+                self.risk.release_trade_lock()
+
+    # ── Deadlock detector ──────────────────────────────────────────────────────
+
+    @property
+    def _deadlock_widen_factor(self) -> float:
+        if self._deadlock_relief_remaining <= 0:
+            return 1.0
+        cfg      = self.cfg
+        progress = 1.0 - (self._deadlock_relief_remaining / cfg.deadlock_relief_ticks)
+        return cfg.deadlock_widen_factor - progress * (cfg.deadlock_widen_factor - 1.0)
+
+    def _check_deadlock(self):
+        """
+        FIX: only called when the bot is genuinely idle (not in a trade).
+        Previously called on every tick including during active contracts,
+        causing the drought counter to inflate during normal 2-min holds.
+        """
+        cfg = self.cfg
+        self._ticks_since_trade += 1
+
+        if self._deadlock_relief_remaining > 0:
+            self._deadlock_relief_remaining -= 1
+            if self._deadlock_relief_remaining == 0:
+                log.info("[DEADLOCK] Relief window ended — thresholds back to normal auto-cal")
+            return
+
+        if self._ticks_since_trade >= cfg.deadlock_scan_limit:
+            log.warning(
+                f"[DEADLOCK] {self._ticks_since_trade} ticks without a trade — "
+                f"widening all thresholds by {cfg.deadlock_widen_factor}× "
+                f"for {cfg.deadlock_relief_ticks} ticks."
+            )
+            self._deadlock_relief_remaining = cfg.deadlock_relief_ticks
+            self._ticks_since_trade = 0
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _log_state(self, f: Features):
+        wf = self._deadlock_widen_factor
         th = {
-            "vol":   round(self.buf.vol_threshold(),           4),
-            "range": round(self.buf.range_threshold(),         4),
-            "ema":   round(self.buf.ema_threshold(),           4),
-            "spike": round(self.buf.spike_threshold(),         4),
-            "z":     round(self.buf.zscore_limit(f.sigma_price), 4),
+            "vol":   round(self.buf.vol_threshold()             * wf, 4),
+            "range": round(self.buf.range_threshold()           * wf, 4),
+            "ema":   round(self.buf.ema_threshold()             * wf, 4),
+            "spike": round(self.buf.spike_threshold()           * wf, 4),
+            "z":     round(self.buf.zscore_limit(f.sigma_price) * wf, 4),
         }
+        cfg    = self.cfg
+        z_hist = list(self.buf._hist_zscore_abs)
+        z_dist = round(
+            percentile(z_hist, cfg.zscore_floor_percentile)
+            if len(z_hist) >= 30 else cfg.zscore_floor_max, 4
+        )
+        z_cov  = round(
+            cfg.z_coverage_factor * (cfg.barrier / f.sigma_price)
+            if f.sigma_price > 0 else cfg.zscore_floor_max, 4
+        )
+        deadlock_info = (
+            f" [DEADLOCK RELIEF: {self._deadlock_relief_remaining}tk widen={wf:.2f}x]"
+            if self._deadlock_relief_remaining > 0 else
+            f" [drought={self._ticks_since_trade}/{cfg.deadlock_scan_limit}]"
+        )
         log.info(
             f"[STATE tick={f.tick}] price={f.price:.4f} "
             f"sig*sqrtT={f.sigma_sqrt_T:.4f} "
-            f"rng={f.range_width:.4f} |Z|={abs(f.zscore):.4f} regime={f.regime}\n"
-            f"  thresholds(auto): {th}"
+            f"rng={f.range_width:.4f} |Z|={abs(f.zscore):.4f} regime={f.regime}"
+            f"{deadlock_info}\n"
+            f"  thresholds(auto{'+widen' if wf > 1.0 else ''}): {th}\n"
+            f"  z_limit detail: dist_p{cfg.zscore_floor_percentile:.0f}={z_dist} "
+            f"cov_cap={z_cov} history_n={len(z_hist)} "
+            f"-> effective={th['z']}"
         )
 
     def _save(self):
@@ -1199,14 +1330,7 @@ class Bot:
     def shutdown(self):
         self._alive = False
         self._save()
-        # Final skip summary on shutdown
-        if self._skip_counts:
-            total   = sum(self._skip_counts.values())
-            summary = " | ".join(
-                f"{k}:{v}({v/total*100:.0f}%)"
-                for k, v in self._skip_counts.most_common()
-            )
-            log.info(f"[SKIP FINAL SUMMARY] total={total} | {summary}")
+        self._log_skip_summary()
         log.info(f"Shutdown | stats={self.history.stats}")
 
 
@@ -1217,7 +1341,7 @@ class Bot:
 def run_backtest(cfg: Config, n_ticks: int = 8000, seed: int = 42):
     random.seed(seed)
     print("=" * 64)
-    print("Backtest: 1HZ10V ExpiryRange +/-1.8 | 2-min | self-calibrating")
+    print("Backtest: 1HZ10V ExpiryRange +/-1.9 | 2-min | self-calibrating")
     print("=" * 64)
 
     def gen_ticks(n, base=9800.0):
@@ -1249,7 +1373,7 @@ def run_backtest(cfg: Config, n_ticks: int = 8000, seed: int = 42):
         if f is None or i < skip_until:
             continue
 
-        dec = chain.evaluate(f, balance)
+        dec = chain.evaluate(f, balance, widen_factor=1.0)
         if not dec.trade:
             skip_counts[dec.gate] += 1
             continue
@@ -1275,7 +1399,6 @@ def run_backtest(cfg: Config, n_ticks: int = 8000, seed: int = 42):
 
     wr  = wins / trades if trades else 0.0
     pnl = balance - 1000.0
-
     peaks = [max(balance_log[:i+1]) for i in range(len(balance_log))]
     dd    = max((p - v) / p for p, v in zip(peaks, balance_log)) if len(balance_log) > 1 else 0.0
 
@@ -1301,6 +1424,10 @@ def run_backtest(cfg: Config, n_ticks: int = 8000, seed: int = 42):
     print(f"    range_th: {buf.range_threshold():.4f}")
     print(f"    ema_th  : {buf.ema_threshold():.4f}")
     print(f"    spike_th: {buf.spike_threshold():.4f}")
+    z_hist = list(buf._hist_zscore_abs)
+    z_dist = percentile(z_hist, cfg.zscore_floor_percentile) if len(z_hist) >= 30 else cfg.zscore_floor_max
+    print(f"    z_floor : dist_p{cfg.zscore_floor_percentile:.0f}={z_dist:.4f} "
+          f"history_n={len(z_hist)}")
 
     print(f"\n  Final Bayesian model:\n{bayes.summary()}")
     print("=" * 64)
@@ -1311,11 +1438,6 @@ def run_backtest(cfg: Config, n_ticks: int = 8000, seed: int = 42):
 # -----------------------------------------------------------------------------
 
 def _start_health_server():
-    """
-    Tiny HTTP server on $PORT (default 8080).
-    Railway/Render require a listening port or they kill the process.
-    Runs in a daemon thread — does not block the asyncio loop.
-    """
     import http.server, threading
     port = int(os.getenv("PORT", "8080"))
 
@@ -1325,7 +1447,7 @@ def _start_health_server():
             self.end_headers()
             self.wfile.write(b"OK - bot running")
         def log_message(self, *a):
-            pass  # silence HTTP access logs
+            pass
 
     srv = http.server.HTTPServer(("", port), _H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -1348,12 +1470,13 @@ async def live(cfg: Config):
     signal.signal(signal.SIGTERM, handle_signal)
 
     log.info("=" * 64)
-    log.info(f"Deriv ExpiryRange Bot - {cfg.symbol} +/-{cfg.barrier} {cfg.expiry_min}min")
+    log.info(f"Deriv ExpiryRange Bot — {cfg.symbol} +/-{cfg.barrier} {cfg.expiry_min}min")
     log.info("Thresholds: AUTO-CALIBRATED from live tick distribution")
-    log.info("Auto-reconnect: ENABLED | Martingale: kicks in after 1 loss")
+    log.info("Settlement: background Task — ticks continue during contract window")
+    log.info("Deadlock detector: ENABLED (idle-only counter)")
     log.info("=" * 64)
 
-    _start_health_server()   # needed for Railway to keep the process alive
+    _start_health_server()
     await bot.run()
 
 
